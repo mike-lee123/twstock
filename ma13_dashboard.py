@@ -40,6 +40,7 @@ from ma13_system import (
     overnight_table,
     resample_ohlc,
 )
+import ma13_closed_loop as cl
 import sinopac_data as sjd
 import tw_symbols as tws
 
@@ -246,6 +247,10 @@ with st.sidebar:
 
 # ───────────────────────── 載入 ─────────────────────────
 sj_m1 = None   # 永豐 1 分K（所有週期都由它合成）
+if source != "上傳 CSV" and not (symbol or "").strip():
+    st.title("📈 13MA 的魔力")
+    st.info("請在左側「代號」選擇或輸入商品代號（例如 2330），輸入後按 Enter。", icon="👈")
+    st.stop()
 try:
     if source == "上傳 CSV":
         if upload is None:
@@ -437,8 +442,8 @@ def build_chart(view: pd.DataFrame) -> go.Figure:
     return fig
 
 
-tab_chart, tab_open, tab_bt, tab_odd, tab_fib, tab_rules = st.tabs(
-    ["📈 走勢圖", "🌅 開盤劇情", "📊 回測", "🌙 零股隔日沖", "📐 費氏座標", "📖 規則"])
+tab_chart, tab_open, tab_bt, tab_loop, tab_odd, tab_fib, tab_rules = st.tabs(
+    ["📈 走勢圖", "🌅 開盤劇情", "📊 回測", "🔁 閉環系統", "🌙 零股隔日沖", "📐 費氏座標", "📖 規則"])
 
 with tab_chart:
     st.plotly_chart(build_chart(df.tail(show_bars)))
@@ -583,6 +588,176 @@ with tab_bt:
                      column_config={"損益": st.column_config.NumberColumn(format="%+.2f")})
         st.download_button("下載交易明細 CSV", tbl.to_csv(index=False).encode("utf-8-sig"),
                            file_name="ma13_trades.csv", mime="text/csv")
+
+
+# ───────────────────────── 閉環系統（第 2～4 層） ─────────────────────────
+def closed_loop_inputs():
+    """回傳（日盤 5 分K、夜盤 K、日 K、說明）；沒有 5 分K 時回傳 None"""
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    if sj_m1 is not None:
+        day, night = cl.split_sessions(sj_m1)
+        if day.empty:
+            return None
+        return sjd.to_interval(day, "5m"), night, cl.daily_from_intraday(day), "永豐 1 分K（日盤／夜盤自動分開）"
+    if source == "上傳 CSV":
+        if interval != "5m":
+            return None
+        day, night = cl.split_sessions(raw_df)
+        return day, night, cl.daily_from_intraday(day), "上傳的 5 分K"
+    if not has_intraday:
+        return None
+    try:
+        daily = fetch_yf(symbol, "1y", "1d")
+    except Exception:  # noqa: BLE001
+        daily = cl.daily_from_intraday(intraday)
+    return intraday, empty, daily, "Yahoo 5 分K（近 60 天）＋日 K 1 年；Yahoo 沒有夜盤"
+
+
+@st.cache_data(show_spinner="計算三週期共振與每日記錄…")
+def cached_closed_loop(d5_: pd.DataFrame, night_: pd.DataFrame, daily_: pd.DataFrame, long_only_: bool,
+                       counter_: bool, stop_: float | None, half_pts_: float | None, half_pct_: float,
+                       cost_: float):
+    f5, f30, fd = cl.build_frame(d5_, daily_)
+    tr = cl.run(f5, long_only=long_only_, counter=counter_, stop=stop_, half_min_pct=half_pct_,
+                cost=cost_, half_min_pts=half_pts_)
+    return f5, tr, cl.rule_stats(tr), cl.daily_journal(f5, night_, fd, f30, tr)
+
+
+with tab_loop:
+    st.caption("老哥說的「閉環」：有開始也有結束、不會斷掉、可以一直跑。"
+               "第 1 層（單一週期進出場）在「📊 回測」；這裡是第 2～4 層。")
+    inputs = closed_loop_inputs()
+    if inputs is None:
+        st.info("閉環系統需要 5 分K（Yahoo 近 60 天、永豐 API，或上傳 5m 的 CSV）。")
+    else:
+        cl5, cl_night, cl_daily, cl_src = inputs
+        o1, o2, o3 = st.columns(3)
+        counter = o1.toggle("逆勢當沖（日線、30 分都反向時也做 5 分K 訊號）", value=True)
+        half_mode = o2.radio("「回吐一半」啟動門檻", ["依側欄點數", "依進場價 %"], horizontal=True,
+                             help="最高獲利超過門檻才啟動回吐一半就砍，避免小波動就出場")
+        half_pct = o3.number_input("門檻（進場價 %）", 0.0, 5.0, 0.1, 0.05,
+                                   disabled=half_mode != "依進場價 %")
+        half_pts = min_profit if half_mode == "依側欄點數" else None
+
+        f5c, trades_cl, stats_cl, journal_cl = cached_closed_loop(
+            cl5, cl_night, cl_daily, long_only, counter, stop, half_pts, half_pct, cost)
+        st.caption(f"資料：{cl_src}　{cl5.index[0]:%Y-%m-%d} ～ {cl5.index[-1]:%Y-%m-%d}　"
+                   f"日 K {len(cl_daily)} 天　夜盤 {len(cl_night):,} 根")
+
+        # ── 目前三週期狀態
+        st.subheader("目前三週期狀態")
+        r = f5c.iloc[-1]
+        dd, m30, m5 = int(r["日線"]), int(r["三十分"]), int(r["五分"])
+        icon = {1: "多 🔴", -1: "空 🟢", 0: "— ⚪"}
+        s1, s2, s3 = st.columns(3)
+        s1.metric("日線（前一日收盤）", icon[dd])
+        s2.metric("30 分K", icon[m30])
+        s3.metric("5 分K", icon[m5], f"{r['Close'] - r['MA13']:+,.1f} 距 13MA", delta_color="inverse")
+        if dd == m30 == m5 != 0:
+            st.success(f"**三週期共振（{cl.DIR_TXT[dd]}）**：可抱波段單", icon="🔁")
+        elif dd == m30 != 0:
+            st.warning(f"日線、30 分同為**{cl.DIR_TXT[dd]}**，5 分K 逆向：波段單減碼或觀望；逆向只能做當沖", icon="⚠️")
+        else:
+            st.info("週期不一致：只做當沖，收盤前一定平倉", icon="⏱️")
+
+        # ── 第 2 層
+        st.subheader("第 2 層・時間閉環：每日時間記錄")
+        ok = (journal_cl["時間銜接檢查"] == "完整").mean() if len(journal_cl) else 0
+        j1, j2, j3, j4 = st.columns(4)
+        j1.metric("記錄天數", f"{len(journal_cl)} 天")
+        j2.metric("時間銜接完整", f"{ok:.0%}")
+        cover_col = f"推估幅度(×{OPEN_ENERGY_MULT})"
+        j3.metric(f"第一根 ×{OPEN_ENERGY_MULT} 涵蓋實際幅度", f"{journal_cl['推估是否涵蓋'].mean():.0%}")
+        j4.metric("缺口全補比例", f"{(journal_cl.get('缺口回補') == '全補').mean():.0%}"
+                  if "缺口回補" in journal_cl else "—")
+        if cl_night.empty:
+            msg = ("夜盤沒有資料，所以每天都會標「無夜盤資料」——這就是第 2 層缺的那一段。")
+            if source == "永豐 Shioaji":
+                msg += "要記錄夜盤：期貨代號（如 TXFR1）並關掉側欄「期貨只取日盤」。"
+            elif source == "Yahoo Finance":
+                msg += "要記錄夜盤請改用永豐 API 抓期貨（如 TXFR1），並關掉「期貨只取日盤」。"
+            st.info(msg, icon="🌙")
+        jcols = ["日期", "星期", "昨收", "夜盤高", "夜盤低", "夜盤收", "夜盤收→開盤", "開盤", "跳空點", "跳空%",
+                 "缺口大小", "第一根5分K振幅", cover_col, "實際幅度", "缺口回補", "收盤",
+                 "收盤時日線", "收盤時30分", "收盤時5分", "當日交易筆數", "當日損益點", "時間銜接檢查"]
+        jview = journal_cl[[c for c in jcols if c in journal_cl]].iloc[::-1]
+        st.dataframe(jview, hide_index=True, width="stretch", column_config={
+            c: st.column_config.NumberColumn(format="%.0f") for c in
+            ["昨收", "夜盤高", "夜盤低", "夜盤收", "開盤", "收盤", "第一根5分K振幅", cover_col, "實際幅度"]
+        } | {"跳空點": st.column_config.NumberColumn(format="%+.0f"),
+             "夜盤收→開盤": st.column_config.NumberColumn(format="%+.0f"),
+             "跳空%": st.column_config.NumberColumn(format="%+.2f%%"),
+             "當日損益點": st.column_config.NumberColumn(format="%+.1f")})
+
+        # ── 第 3 層
+        st.subheader("第 3 層・週期閉環：三週期共振回測")
+        st.caption("進場：5 分K 多頭／空頭成立。日線＋30 分＋5 分同向 → **波段單**（30 分K 反向穿越 13MA 或日線翻轉才出，可留倉）；"
+                   "其他 → **當沖單**（5 分K 反向穿越 13MA 出場，收盤前一定平倉）。"
+                   f"全部：獲利回吐超過 {HALF_RETRACE:.0%} 就砍"
+                   + (f"、停損 {stop:g} 點" if stop else "") + "。以 5 分K 收盤價成交，"
+                   + (f"每筆扣 {cost:g} 點。" if cost else "未計成本。"))
+        if trades_cl.empty:
+            st.info("這段期間沒有交易訊號。")
+        else:
+            p = trades_cl["損益點"]
+            w, l = p[p > 0], p[p <= 0]
+            pf = w.sum() / -l.sum() if l.sum() < 0 else np.inf
+            eqc = p.cumsum()
+            t1, t2, t3, t4, t5, t6 = st.columns(6)
+            t1.metric("交易次數", len(p))
+            t2.metric("勝率", f"{len(w) / len(p):.1%}")
+            t3.metric("總損益（點）", f"{p.sum():+,.0f}")
+            t4.metric("獲利因子", "∞" if np.isinf(pf) else f"{pf:.2f}")
+            t5.metric("最大單筆虧損", f"{p.min():+,.0f}")
+            t6.metric("最大回撤", f"{(eqc - eqc.cummax()).min():+,.0f}")
+
+            fig_l = go.Figure()
+            fig_l.add_scatter(x=trades_cl["出場時間"], y=eqc, mode="lines", name="全部",
+                              line=dict(color=K_COLOR, width=2.5))
+            for typ, color in (("波段", UP), ("當沖", "#868e96")):
+                sub = trades_cl[trades_cl["類型"] == typ]
+                if len(sub):
+                    fig_l.add_scatter(x=sub["出場時間"], y=sub["損益點"].cumsum(), mode="lines",
+                                      name=f"{typ}單", line=dict(color=color, width=1.5, dash="dot"))
+            fig_l.update_layout(height=380, hovermode="x unified", margin=dict(l=10, r=10, t=70, b=10),
+                                title=dict(text="累積損益（點）：全部 vs 波段單 vs 當沖單", y=0.97),
+                                legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"))
+            st.plotly_chart(fig_l)
+
+        # ── 第 4 層
+        st.subheader("第 4 層・驗證閉環：規則統計（從尾到頭）")
+        if not stats_cl.empty:
+            st.caption("每筆交易都記下是哪條規則進場、哪條規則出場——哪一條規則在賺、哪一條在賠，一看就知道。")
+            g1, g2 = st.columns(2)
+            for col, grp, title in ((g1, "類型／進場規則", "依進場規則"), (g2, "出場規則", "依出場規則")):
+                sub = stats_cl[stats_cl["分組"] == grp]
+                fig_s = go.Figure(go.Bar(
+                    x=sub["總損益點"], y=sub["項目"], orientation="h",
+                    marker_color=np.where(sub["總損益點"] >= 0, UP, DOWN),
+                    text=[f"{v:+,.0f}（{n} 筆・勝率 {wr:.0f}%）" for v, n, wr in
+                          zip(sub["總損益點"], sub["筆數"], sub["勝率%"])],
+                    textposition="auto"))
+                fig_s.update_layout(height=60 + 46 * len(sub), title=f"{title}・總損益（點）",
+                                    margin=dict(l=10, r=10, t=40, b=10), yaxis=dict(autorange="reversed"))
+                col.plotly_chart(fig_s)
+            st.dataframe(stats_cl, hide_index=True, width="stretch", column_config={
+                "勝率%": st.column_config.NumberColumn(format="%.1f%%"),
+                "總損益點": st.column_config.NumberColumn(format="%+.1f"),
+                "平均損益點": st.column_config.NumberColumn(format="%+.1f")})
+
+            with st.expander("交易明細（每筆的進出場規則、三週期狀態、最大有利／不利）"):
+                st.dataframe(trades_cl.iloc[::-1], hide_index=True, width="stretch",
+                             column_config={"損益點": st.column_config.NumberColumn(format="%+.2f")})
+
+        tag = cl.safe_name(symbol)
+        b1, b2, b3 = st.columns(3)
+        b1.download_button("下載每日時間記錄 CSV", journal_cl.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"每日時間記錄_{tag}.csv", mime="text/csv")
+        b2.download_button("下載交易明細 CSV", trades_cl.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"交易明細_{tag}.csv", mime="text/csv", disabled=trades_cl.empty)
+        b3.download_button("下載規則統計 CSV", stats_cl.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"規則統計_{tag}.csv", mime="text/csv", disabled=stats_cl.empty)
+        st.caption("樣本短、未計實際成本與滑價，僅供檢討規則用，不構成投資建議。")
 
 
 # ───────────────────────── 零股隔日沖 ─────────────────────────
@@ -746,6 +921,8 @@ with tab_rules:
 5. **費氏座標**：0.382 / 0.5 / 0.618 回檔，費氏數列關卡（80→130→210…）。
 6. **飆股**：KD>80 且低點不破 → 目標價 ×3（極端條件，僅作標記）。
 7. **缺口要量化記錄**：跳多少點、補了一半還是全補。
+8. **閉環**：有開始也有結束、不會斷掉、可以一直跑（見「🔁 閉環系統」）。
+   時間要接起來（夜盤→開盤→收盤）、週期要共振（日線＋30 分＋5 分），每筆交易都要能從結果回推是哪條規則。
 
 > 規則來源：老哥錄音談話整理。教學用規則化程式，未計手續費、滑價與稅，不構成投資建議。
 """)

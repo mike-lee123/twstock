@@ -1,6 +1,6 @@
 # 13MA 的魔力 — Streamlit 儀表板
 
-把老哥的 13MA 操作規則整理成互動儀表板：走勢圖、開盤劇情、回測（單一週期／30 分K定方向＋5 分K進場）、零股隔日沖、費氏座標。資料來源可選 Yahoo Finance、永豐 Shioaji API（只讀行情、不下單）或上傳 CSV。
+把老哥的 13MA 操作規則整理成互動儀表板：走勢圖、開盤劇情、回測（單一週期／30 分K定方向＋5 分K進場）、閉環系統（三週期共振、每日時間記錄、規則統計）、零股隔日沖、費氏座標。資料來源可選 Yahoo Finance、永豐 Shioaji API（只讀行情、不下單）或上傳 CSV。
 
 教學用途，不構成投資建議。
 
@@ -10,8 +10,10 @@
 |---|---|
 | `ma13_dashboard.py` | 主程式（Streamlit 入口） |
 | `ma13_system.py` | 規則與回測引擎（也能單獨在命令列執行） |
+| `ma13_closed_loop.py` | 閉環系統：日線＋30 分＋5 分共振、每日時間記錄、交易記錄與規則統計（也能單獨在命令列執行） |
 | `sinopac_data.py` | 永豐 API 登入與 K 線下載 |
 | `tw_symbols.py` | 台股代號下拉清單、自動判斷 .TW／.TWO |
+| `tw_codes.csv` | 上市櫃代號表（約 2,158 檔，下拉清單的資料來源） |
 | `requirements.txt` | 套件版本 |
 | `.streamlit/config.toml` | Streamlit 設定 |
 | `.streamlit/secrets.toml.example` | 密碼／金鑰範本（真正的值放雲端 Secrets） |

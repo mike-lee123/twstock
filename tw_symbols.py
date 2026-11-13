@@ -2,13 +2,15 @@
 """
 台股代號清單（下拉選單用）與 Yahoo 後綴自動判斷：上市 → .TW，上櫃 → .TWO。
 
-清單來源：twstock 套件內建的證交所／櫃買中心代號表（離線可用）。
-要更新代號表：python -c "import twstock; twstock.__update_codes()"
+清單來源：同資料夾的 tw_codes.csv（由 twstock 的證交所／櫃買中心代號表匯出，離線可用）。
+要更新：python -c "import twstock; twstock.__update_codes(); import tw_symbols; print(tw_symbols.save_codes_csv())"
 """
 from __future__ import annotations
 
+import csv
 import re
 from functools import lru_cache
+from pathlib import Path
 
 KEEP_TYPES = {"股票", "ETF", "ETN", "特別股", "創新板", "臺灣存託憑證(TDR)"}
 
@@ -46,15 +48,27 @@ SJ_SPECIAL = [("TSE001", "加權指數"), ("OTC101", "櫃買指數"),
               ("TXFR1", "台指期 近月"), ("TXFR2", "台指期 次月"), ("MXFR1", "小台指 近月")]
 
 
+CODES_CSV = Path(__file__).with_name("tw_codes.csv")   # 隨程式附上的代號表（不依賴外部套件）
+
+
 @lru_cache(maxsize=1)
 def stock_table() -> dict[str, dict]:
-    """{代號: {name, market, suffix, group, type}}，只留上市（含創新板）與上櫃的股票／ETF 類"""
+    """{代號: {name, market, suffix, group, type}}，只留上市（含創新板）與上櫃的股票／ETF 類。
+    優先讀同資料夾的 tw_codes.csv；讀不到才改用 twstock 套件內建表。"""
+    out: dict[str, dict] = {}
+    try:
+        with CODES_CSV.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                out[r["code"]] = {k: r[k] for k in ("name", "market", "suffix", "group", "type")}
+        if out:
+            return out
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import twstock
         codes = twstock.codes
     except Exception:  # noqa: BLE001
         return {}
-    out = {}
     for code, v in codes.items():
         if v.type not in KEEP_TYPES:
             continue
@@ -67,6 +81,19 @@ def stock_table() -> dict[str, dict]:
         out[code] = {"name": v.name, "market": "上市" if suffix == ".TW" else "上櫃",
                      "suffix": suffix, "group": v.group or v.type, "type": v.type}
     return out
+
+
+def save_codes_csv() -> int:
+    """用 twstock 最新代號表重寫 tw_codes.csv（先執行 twstock.__update_codes() 可取得最新資料）"""
+    stock_table.cache_clear()
+    CODES_CSV.rename(CODES_CSV.with_suffix(".bak")) if CODES_CSV.exists() else None
+    tbl = stock_table()
+    with CODES_CSV.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["code", "name", "market", "suffix", "group", "type"])
+        for c, v in sorted(tbl.items()):
+            w.writerow([c, v["name"], v["market"], v["suffix"], v["group"], v["type"]])
+    return len(tbl)
 
 
 def _label(code: str, info: dict) -> str:

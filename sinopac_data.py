@@ -24,11 +24,25 @@ def login(api_key: str, secret_key: str, simulation: bool = False):
     api = sj.Shioaji(simulation=simulation)
     accounts = api.login(api_key=api_key.strip(), secret_key=secret_key.strip(),
                          subscribe_trade=False)
-    try:
-        api.fetch_contracts(contract_download=True)
-    except Exception:  # noqa: BLE001 — 有些版本 login 時已自動下載
-        pass
+    wait_contracts(api)
     return api, accounts
+
+
+def wait_contracts(api, timeout: float = 60.0) -> None:
+    """確認合約表已下載完成（沒下載完時查代號會拿到空的或錯的物件）"""
+    import time
+
+    def status():
+        return str(getattr(api.Contracts, "status", "")).split(".")[-1]
+
+    if status() != "Fetched":
+        try:
+            api.fetch_contracts(contract_download=True)
+        except Exception:  # noqa: BLE001
+            pass
+    t0 = time.time()
+    while status() not in ("Fetched", "") and time.time() - t0 < timeout:
+        time.sleep(0.5)
 
 
 def account_lines(accounts) -> list[str]:
@@ -41,26 +55,45 @@ def account_lines(accounts) -> list[str]:
     return out
 
 
+def _is_contract(obj) -> bool:
+    """只接受單一合約（Stock/Future/Option/Index…），排除合約群組等其他物件"""
+    if obj is None:
+        return False
+    try:
+        import shioaji as sj
+        kinds = tuple(t for t in (getattr(sj, n, None) for n in
+                      ("BaseContract", "Contract", "Stock", "Future", "Option", "Index", "ComboContract"))
+                      if isinstance(t, type))
+        if kinds and isinstance(obj, kinds):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(getattr(obj, "code", None)) and bool(getattr(obj, "security_type", None))
+
+
 def resolve_contract(api, code: str):
-    """依代號找合約：指數 TSE/OTC 開頭、期貨（TXFR1…）、其餘當股票"""
-    code = code.strip().upper()
+    """依代號找合約：指數 TSE/OTC 開頭、期貨（TXFR1…）、其餘當股票／ETF"""
+    code = code.strip().upper().split(".")[0]          # 2330.TW → 2330
+    wait_contracts(api, timeout=30)
     C = api.Contracts
     tries = []
     if code[:3] in ("TSE", "OTC") and code[3:].isdigit():
-        grp = lambda: getattr(C.Indexs, code[:3])  # noqa: E731
-        tries += [lambda: grp()[code[3:]], lambda: grp()[code], lambda: getattr(grp(), code)]
+        tries += [lambda: getattr(C.Indexs, code[:3])[code[3:]],
+                  lambda: getattr(C.Indexs, code[:3])[code],
+                  lambda: C.Indexs[code[3:]], lambda: C.Indexs[code]]
+    tries += [lambda: C.Stocks[code]]                    # 股票、ETF（含 00631L 這類英文字尾）
     if not code.isdigit():
-        tries += [lambda: C.Futures[code], lambda: C.Futures[code[:3]][code],
-                  lambda: getattr(getattr(C.Futures, code[:3]), code)]
-    tries += [lambda: C.Stocks[code]]
+        tries += [lambda: C.Futures[code], lambda: getattr(C.Futures, code[:3])[code]]
     for t in tries:
         try:
             c = t()
-            if c is not None:
-                return c
         except Exception:  # noqa: BLE001
             continue
-    raise ValueError(f"找不到商品代號 {code}（股票如 2330；指數如 TSE001；期貨如 TXFR1）")
+        if _is_contract(c):
+            return c
+    st = str(getattr(C, "status", "")).split(".")[-1]
+    hint = "（合約表尚未下載完成，請稍後再按一次讀取，或登出後重新登入）" if st and st != "Fetched" else ""
+    raise ValueError(f"找不到商品代號 {code}{hint}。股票如 2330；指數如 TSE001；期貨如 TXFR1")
 
 
 def is_futures(contract) -> bool:

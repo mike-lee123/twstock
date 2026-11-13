@@ -90,12 +90,37 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close"]].dropna()
 
 
+class EmptyData(Exception):
+    """抓到空資料：丟例外讓快取不要記住空結果，下次重新整理會再抓"""
+
+
 @st.cache_data(ttl=600, show_spinner="下載行情中…")
-def fetch_yf(symbol: str, period: str, interval: str) -> pd.DataFrame:
+def _yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    import time
+
     import yfinance as yf
-    df = yf.download(symbol, period=period, interval=interval,
-                     auto_adjust=False, progress=False)
-    return _clean(df)
+    last_err = None
+    for wait in (0, 2, 5):            # 雲端主機 IP 共用，Yahoo 偶爾限流 → 稍等重試
+        time.sleep(wait)
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             auto_adjust=False, progress=False)
+            if df is not None and not df.empty:
+                df = _clean(df)
+                if not df.empty:
+                    return df
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise EmptyData(str(last_err) if last_err else "Yahoo 回傳空資料")
+
+
+def fetch_yf(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """抓不到時回傳空表（錯誤原因放在 session_state，給畫面顯示）"""
+    try:
+        return _yf_download(symbol, period, interval)
+    except Exception as e:  # noqa: BLE001
+        st.session_state["yf_last_err"] = f"{symbol} {period} {interval}：{e}"
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
 
 
 @st.cache_data(ttl=86400, show_spinner="判斷上市／上櫃…")
@@ -124,7 +149,10 @@ def read_csv(raw: bytes) -> pd.DataFrame:
 def fetch_sj(_api, session_id: str, code: str, start: dt.date, end: dt.date,
              day_only: bool) -> pd.DataFrame:
     """_api 不參與快取鍵；session_id 讓換帳號／重新登入後重新抓"""
-    return sjd.fetch_minutes(_api, code, start, end, day_session_only=day_only)
+    df = sjd.fetch_minutes(_api, code, start, end, day_session_only=day_only)
+    if df.empty:
+        raise EmptyData(f"永豐回傳 0 根 K 棒（{code}，{start}～{end}）")
+    return df
 
 
 def sinopac_login_panel():
@@ -274,7 +302,10 @@ try:
         if sj_start > sj_end:
             st.error("起始日不能晚於結束日。")
             st.stop()
-        sj_m1 = fetch_sj(sj_sess["api"], sj_sess["id"], symbol.strip().upper(), sj_start, sj_end, sj_day_only)
+        try:
+            sj_m1 = fetch_sj(sj_sess["api"], sj_sess["id"], symbol.strip().upper(), sj_start, sj_end, sj_day_only)
+        except EmptyData:
+            sj_m1 = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
         raw_df = sjd.to_interval(sj_m1, interval)
     else:
         raw_df = fetch_yf(symbol, period, interval)
@@ -283,7 +314,25 @@ except Exception as e:  # noqa: BLE001
     st.stop()
 
 if raw_df.empty or len(raw_df) < MA_LEN + 2:
-    st.error("抓不到足夠資料，請確認代號、週期（Yahoo 分 K 最多 60 天）、永豐日期區間或 CSV 檔。")
+    st.title("📈 13MA 的魔力")
+    n = 0 if raw_df is None else len(raw_df)
+    st.error(f"抓不到足夠資料：{source}｜代號 **{symbol or '（空白）'}**｜週期 {interval}｜期間 {period}"
+             f"｜取得 {n} 根 K 棒（至少要 {MA_LEN + 2} 根）。")
+    tips = []
+    if source == "Yahoo Finance":
+        tips += ["Yahoo 分 K（5m～60m）最多只能抓近 60 天，「資料期間」請填 60d 以內；日 K 可用 1y、2y。",
+                 "雲端主機的 IP 是共用的，Yahoo 偶爾會限流回傳空資料：等 1～2 分鐘後按右上角 ⋮ → Rerun 再試。",
+                 "確認代號正確；清單外的代號可在「或自行輸入代號」欄輸入。"]
+        if st.session_state.get("yf_last_err"):
+            tips.append(f"最近一次 Yahoo 錯誤：`{st.session_state['yf_last_err']}`")
+    elif source == "永豐 Shioaji":
+        tips += ["**模擬環境**的歷史 K 線很少或沒有，請登出後關掉「模擬環境」改用正式環境登入。",
+                 "確認日期區間內有交易日；週 K／日 K 需要較長的區間（至少約半年）。",
+                 "代號寫法：股票 2330、指數 TSE001、期貨 TXFR1。",
+                 "若一直是 0 根，可能是雲端主機（美國）連永豐受限，請改用 Yahoo 資料來源。"]
+    else:
+        tips.append("CSV 第一欄要是日期時間，並有 Open、High、Low、Close 欄位。")
+    st.markdown("\n".join(f"- {t}" for t in tips))
     st.stop()
 
 df = add_indicators(raw_df)

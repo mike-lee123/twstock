@@ -11,3 +11,5 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+交易記錄/
+*.log

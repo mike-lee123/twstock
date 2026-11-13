@@ -616,11 +616,25 @@ def closed_loop_inputs():
 @st.cache_data(show_spinner="計算三週期共振與每日記錄…")
 def cached_closed_loop(d5_: pd.DataFrame, night_: pd.DataFrame, daily_: pd.DataFrame, long_only_: bool,
                        counter_: bool, stop_: float | None, half_pts_: float | None, half_pct_: float,
-                       cost_: float):
+                       cost_: float, allow_daytrade_: bool, half_floor_: float, expect_night_: bool):
     f5, f30, fd = cl.build_frame(d5_, daily_)
     tr = cl.run(f5, long_only=long_only_, counter=counter_, stop=stop_, half_min_pct=half_pct_,
-                cost=cost_, half_min_pts=half_pts_)
-    return f5, tr, cl.rule_stats(tr), cl.daily_journal(f5, night_, fd, f30, tr)
+                cost=cost_, half_min_pts=half_pts_, allow_daytrade=allow_daytrade_, half_floor=half_floor_)
+    return f5, tr, cl.rule_stats(tr), cl.daily_journal(f5, night_, fd, f30, tr, expect_night=expect_night_)
+
+
+def detect_kind(cl_night_: pd.DataFrame) -> str:
+    """商品類型：永豐看合約本身；Yahoo 看代號；CSV 有夜盤就當期貨"""
+    if source == "永豐 Shioaji" and sj_sess is not None:
+        try:
+            if sjd.is_futures(sjd.resolve_contract(sj_sess["api"], symbol)):
+                return "futures"
+        except Exception:  # noqa: BLE001
+            pass
+        return cl.instrument_kind(symbol)
+    if source == "上傳 CSV":
+        return "futures" if len(cl_night_) else "index"
+    return cl.instrument_kind(symbol)
 
 
 with tab_loop:
@@ -639,10 +653,38 @@ with tab_loop:
                                    disabled=half_mode != "依進場價 %")
         half_pts = min_profit if half_mode == "依側欄點數" else None
 
+        # ── 商品類型、跳動單位、當沖濾網
+        auto_kind = detect_kind(cl_night)
+        kinds = list(cl.KIND_TXT)
+        with st.expander(f"⚙️ 商品類型與當沖濾網（自動判斷：{cl.KIND_TXT[auto_kind]}）"):
+            k1, k2, k3 = st.columns(3)
+            kind = k1.selectbox("商品類型", kinds, index=kinds.index(auto_kind), format_func=cl.KIND_TXT.get,
+                                key=f"cl_kind_{symbol}",
+                                help="期貨才檢查夜盤；股票、ETF、指數本來就沒有夜盤，不算缺漏")
+            auto_tick = cl.tick_size(float(cl5["Close"].iloc[-1]), kind)
+            tick = k2.number_input("最小跳動單位", min_value=0.01, value=float(auto_tick), step=0.01,
+                                   format="%.2f", key=f"cl_tick_{symbol}_{kind}",
+                                   help="依台灣規則自動帶入（股票 100～500 元 0.5、500～1000 元 1…；指數、台指期 1 點）")
+            min_ticks = k3.number_input("5 分K 平均振幅至少幾檔才做當沖", min_value=0.0, value=3.0, step=0.5,
+                                        help="振幅太小，13MA 會被一兩檔來回洗出場。設 0 關閉濾網。")
+        chk = cl.daytrade_check(cl5, kind, min_ticks, tick)
+        expect_night = kind == "futures"
+
         f5c, trades_cl, stats_cl, journal_cl = cached_closed_loop(
-            cl5, cl_night, cl_daily, long_only, counter, stop, half_pts, half_pct, cost)
+            cl5, cl_night, cl_daily, long_only, counter, stop, half_pts, half_pct, cost,
+            chk["allow_daytrade"], tick * min_ticks, expect_night)
         st.caption(f"資料：{cl_src}　{cl5.index[0]:%Y-%m-%d} ～ {cl5.index[-1]:%Y-%m-%d}　"
                    f"日 K {len(cl_daily)} 天　夜盤 {len(cl_night):,} 根")
+        vol_txt = (f"{cl.KIND_TXT[kind]}・跳動單位 {tick:g}・最近 20 天 5 分K 平均振幅 "
+                   f"{chk['avg_range']:,.2f}（約 **{chk['ticks']:.1f} 檔**）")
+        if chk["allow_daytrade"]:
+            st.caption(f"{vol_txt} ≥ {min_ticks:g} 檔 → 波段單、當沖單都做；"
+                       f"「回吐一半」至少要先賺 {tick * min_ticks:g} 才啟動。")
+        else:
+            st.warning(f"{vol_txt}，不到 {min_ticks:g} 檔：5 分K 的 13MA 會被一兩檔來回洗，"
+                       f"**這檔不適合 5 分K 當沖，只做三週期共振的波段單**；"
+                       f"「回吐一半」至少要先賺 {tick * min_ticks:g} 才啟動。"
+                       "（老哥：能量不夠的股票看日線、小波段看 30 分）", icon="🐢")
 
         # ── 目前三週期狀態
         st.subheader("目前三週期狀態")
@@ -670,12 +712,14 @@ with tab_loop:
         j3.metric(f"第一根 ×{OPEN_ENERGY_MULT} 涵蓋實際幅度", f"{journal_cl['推估是否涵蓋'].mean():.0%}")
         j4.metric("缺口全補比例", f"{(journal_cl.get('缺口回補') == '全補').mean():.0%}"
                   if "缺口回補" in journal_cl else "—")
-        if cl_night.empty:
-            msg = ("夜盤沒有資料，所以每天都會標「無夜盤資料」——這就是第 2 層缺的那一段。")
+        if not expect_night:
+            st.caption(f"{cl.KIND_TXT[kind]}沒有夜盤，時間銜接只檢查開盤與收盤。")
+        elif cl_night.empty:
+            msg = "期貨夜盤沒有資料，所以每天都會標「無夜盤資料」——這就是第 2 層缺的那一段。"
             if source == "永豐 Shioaji":
-                msg += "要記錄夜盤：期貨代號（如 TXFR1）並關掉側欄「期貨只取日盤」。"
-            elif source == "Yahoo Finance":
-                msg += "要記錄夜盤請改用永豐 API 抓期貨（如 TXFR1），並關掉「期貨只取日盤」。"
+                msg += "要記錄夜盤：關掉側欄「期貨只取日盤」。"
+            else:
+                msg += "要記錄夜盤：改用永豐 API 抓期貨（如 TXFR1），並關掉側欄「期貨只取日盤」。"
             st.info(msg, icon="🌙")
         jcols = ["日期", "星期", "昨收", "夜盤高", "夜盤低", "夜盤收", "夜盤收→開盤", "開盤", "跳空點", "跳空%",
                  "缺口大小", "第一根5分K振幅", cover_col, "實際幅度", "缺口回補", "收盤",

@@ -105,6 +105,50 @@ def load(args) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     return d5, night, daily, src
 
 
+# ───────────────────────── 商品類型、跳動單位、當沖濾網 ─────────────────────────
+KIND_TXT = {"stock": "股票", "etf": "ETF", "index": "指數", "futures": "期貨"}
+
+
+def instrument_kind(code: str) -> str:
+    """由代號猜商品類型：index（^TWII、TSE001）、futures（TXFR1、MXFR1）、etf（00 開頭）、stock"""
+    c = code.strip().upper()
+    if c.startswith("^") or (c[:3] in ("TSE", "OTC") and c[3:].isdigit()):
+        return "index"
+    base = c.split(".")[0].split(" ")[0]
+    if base[:4].isdigit():                      # 2330、0050、00631L
+        return "etf" if base.startswith("00") else "stock"
+    return "futures"
+
+
+def tick_size(price: float, kind: str) -> float:
+    """台灣最小跳動單位（指數、台指期以 1 點計）"""
+    if kind in ("index", "futures"):
+        return 1.0
+    if kind == "etf":
+        return 0.01 if price < 50 else 0.05
+    for limit, tick in ((10, 0.01), (50, 0.05), (100, 0.1), (500, 0.5), (1000, 1.0)):
+        if price < limit:
+            return tick
+    return 5.0
+
+
+def bar_ticks(d5: pd.DataFrame, tick: float, recent_days: int = 20) -> tuple[float, float]:
+    """最近 recent_days 天 5 分K 的平均振幅，以及等於幾個跳動單位"""
+    days = sorted(set(d5.index.date))[-recent_days:]
+    recent = d5[pd.Index(d5.index.date).isin(days)]
+    rng = float((recent["High"] - recent["Low"]).mean())
+    return rng, rng / tick if tick else np.inf
+
+
+def daytrade_check(d5: pd.DataFrame, kind: str, min_ticks: float = 3.0,
+                   tick: float | None = None) -> dict:
+    """5 分K 平均振幅不到 min_ticks 檔 → 波動太小，13MA 會被一檔來回洗，不做當沖單"""
+    tick = tick or tick_size(float(d5["Close"].iloc[-1]), kind)
+    rng, n = bar_ticks(d5, tick)
+    return {"tick": tick, "avg_range": rng, "ticks": n, "allow_daytrade": n >= min_ticks,
+            "min_ticks": min_ticks}
+
+
 # ───────────────────────── 第 3 層：三週期方向 ─────────────────────────
 def direction(df: pd.DataFrame) -> np.ndarray:
     """13MA 之上＝多(1)，之下＝空(-1)，還算不出來＝0"""
@@ -192,8 +236,13 @@ class Trade:
 
 
 def run(f5: pd.DataFrame, long_only: bool = False, counter: bool = True, stop: float | None = None,
-        half_min_pct: float = 0.1, cost: float = 0.0, half_min_pts: float | None = None) -> pd.DataFrame:
-    """half_min_pts 有給（點數）就用它當「回吐一半」的啟動門檻，否則用進場價的 half_min_pct %"""
+        half_min_pct: float = 0.1, cost: float = 0.0, half_min_pts: float | None = None,
+        allow_daytrade: bool = True, half_floor: float = 0.0) -> pd.DataFrame:
+    """
+    half_min_pts 有給（點數）就用它當「回吐一半」的啟動門檻，否則用進場價的 half_min_pct %。
+    allow_daytrade=False：波動太小的商品不做當沖單，只做三週期共振的波段單。
+    half_floor：「回吐一半」門檻的下限（例如 3 檔），避免賺一檔、回一檔就被洗出場。
+    """
     trades: list[Trade] = []
     pos: Trade | None = None
     best = np.nan
@@ -226,7 +275,8 @@ def run(f5: pd.DataFrame, long_only: bool = False, counter: bool = True, stop: f
                     reason = "日線翻轉"
             elif (price - ma) * s < 0:
                 reason = f"5分{'跌破' if s == 1 else '站上'}13MA"
-            thr = half_min_pts if half_min_pts is not None else pos.進場價 * half_min_pct / 100
+            thr = max(half_min_pts if half_min_pts is not None else pos.進場價 * half_min_pct / 100,
+                      half_floor)
             if not reason and max_gain > thr and gain < max_gain * HALF_RETRACE:
                 reason = "回吐超過一半"
             if not reason and stop is not None and gain <= -stop:
@@ -245,7 +295,7 @@ def run(f5: pd.DataFrame, long_only: bool = False, counter: bool = True, stop: f
                 side = 0
             if side:
                 typ, rule = classify(side, d, m30)
-                if rule.startswith("只有5分") and not counter:
+                if (rule.startswith("只有5分") and not counter) or (typ == "當沖" and not allow_daytrade):
                     continue
                 pos = Trade(len(trades) + 1, typ, DIR_TXT[side], rule, ts, price,
                             DIR_TXT[d], DIR_TXT[m30], price, ma, 成本=cost)
@@ -280,7 +330,8 @@ def rule_stats(tr: pd.DataFrame) -> pd.DataFrame:
 
 # ───────────────────────── 第 2 層：每日時間記錄 ─────────────────────────
 def daily_journal(f5: pd.DataFrame, night: pd.DataFrame, fd: pd.DataFrame, f30: pd.DataFrame,
-                  trades: pd.DataFrame) -> pd.DataFrame:
+                  trades: pd.DataFrame, expect_night: bool = True) -> pd.DataFrame:
+    """expect_night=False（股票、ETF、指數本來就沒有夜盤）時，不把「沒有夜盤」算成缺漏"""
     days = list(f5.groupby(f5.index.date))
     if not days:
         return pd.DataFrame()
@@ -315,9 +366,9 @@ def daily_journal(f5: pd.DataFrame, night: pd.DataFrame, fd: pd.DataFrame, f30: 
                     row.update({"夜盤高": n["High"].max(), "夜盤低": n["Low"].min(), "夜盤收": n["Close"].iloc[-1],
                                 "夜盤漲跌": n["Close"].iloc[-1] - prev_close,
                                 "夜盤收→開盤": first["Open"] - n["Close"].iloc[-1]})
-                else:
+                elif expect_night:
                     missing.append("夜盤缺")
-            else:
+            elif expect_night:
                 missing.append("無夜盤資料")
         else:
             missing.append("第一天：無昨收可比")
@@ -398,6 +449,11 @@ def main():
     p.add_argument("--half-min-pct", type=float, default=0.1,
                    help="獲利超過進場價的幾 %%，才啟用「回吐一半就砍」（預設 0.1%%，避免小波動就出場）")
     p.add_argument("--cost", type=float, default=0.0, help="每筆來回成本（點）")
+    p.add_argument("--kind", choices=["auto", *KIND_TXT], default="auto",
+                   help="商品類型（決定跳動單位、要不要檢查夜盤）；auto 依代號判斷，CSV 有夜盤就當期貨")
+    p.add_argument("--tick", type=float, help="最小跳動單位（不填就依台灣規則自動算）")
+    p.add_argument("--min-ticks", type=float, default=3.0,
+                   help="5 分K 平均振幅至少幾檔才做當沖單（預設 3；設 0 關閉濾網）")
     p.add_argument("--out", default="交易記錄", help="輸出資料夾")
     p.add_argument("--show", type=int, default=10, help="畫面顯示最近幾筆交易／幾天記錄")
     args = p.parse_args()
@@ -406,13 +462,28 @@ def main():
     f5, f30, fd = build_frame(d5, daily)
     print(f"══ 13MA 閉環系統 ══ {src}\n")
 
+    if args.kind != "auto":
+        kind = args.kind
+    elif args.csv:
+        kind = "futures" if len(night) else "index"
+    else:
+        kind = instrument_kind(args.symbol)
+    chk = daytrade_check(d5, kind, args.min_ticks, args.tick)
+
     print("【目前三週期狀態】")
     print(now_state(f5))
+    print(f"\n【商品】{KIND_TXT[kind]}｜跳動單位 {chk['tick']:g}｜最近 20 天 5 分K 平均振幅 "
+          f"{chk['avg_range']:,.2f}（約 {chk['ticks']:.1f} 檔）")
+    if chk["allow_daytrade"]:
+        print(f"  → 振幅 ≥ {args.min_ticks:g} 檔：波段單與當沖單都做")
+    else:
+        print(f"  → 振幅不到 {args.min_ticks:g} 檔：5 分K 的 13MA 會被一兩檔來回洗，這檔不適合 5 分K 當沖，只做波段單")
 
     trades = run(f5, long_only=args.long_only, counter=not args.no_counter, stop=args.stop,
-                 half_min_pct=args.half_min_pct, cost=args.cost)
+                 half_min_pct=args.half_min_pct, cost=args.cost, allow_daytrade=chk["allow_daytrade"],
+                 half_floor=chk["tick"] * args.min_ticks)
     stats = rule_stats(trades)
-    journal = daily_journal(f5, night, fd, f30, trades)
+    journal = daily_journal(f5, night, fd, f30, trades, expect_night=kind == "futures")
 
     os.makedirs(args.out, exist_ok=True)
     tag = safe_name(os.path.splitext(os.path.basename(args.csv))[0] if args.csv else args.symbol)

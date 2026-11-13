@@ -187,7 +187,11 @@ with st.sidebar:
             key=f"sym_sj_{sj_cat}", accept_new_options=True,
             help="可直接打代號或名稱搜尋；清單外的代號也可直接輸入後按 Enter。"
                  "指數 TSE001／OTC101、期貨 TXFR1／MXFR1 在最上面。")
-        symbol = tws.code_of(sym_choice)
+        sj_manual = st.text_input("或自行輸入代號", key="manual_sj", placeholder="例如 2330、00631L、TSE001、TXFR1",
+                                  help="有填這格就以這格為準；清空後回到上方下拉選單。")
+        symbol = tws.code_of(sj_manual) if sj_manual.strip() else tws.code_of(sym_choice)
+        if sj_manual.strip():
+            st.caption(f"使用自行輸入的代號：**{tws.display_name(symbol)}**")
         interval = st.selectbox("K 棒週期", ["5m", "15m", "30m", "60m", "1d", "1wk"], index=2)
         today = TODAY
         d1, d2 = st.columns(2)
@@ -204,7 +208,11 @@ with st.sidebar:
             accept_new_options=True,
             help="可直接打代號或名稱搜尋（如 2330、台積電）；自動判斷上市 .TW／上櫃 .TWO。"
                  "清單外的代號也可直接輸入後按 Enter。")
-        symbol = resolve_yahoo(sym_choice)
+        yf_manual = st.text_input("或自行輸入代號", key="manual_yahoo", placeholder="例如 2330、6488、00631L、^TWII",
+                                  help="有填這格就以這格為準，會自動判斷上市 .TW／上櫃 .TWO；清空後回到上方下拉選單。")
+        symbol = resolve_yahoo(yf_manual if yf_manual.strip() else sym_choice)
+        if yf_manual.strip() and symbol:
+            st.caption(f"使用自行輸入的代號：**{tws.display_name(symbol)}**")
         if symbol and not symbol.startswith("^"):
             mkt = "上櫃" if symbol.endswith(".TWO") else ("上市" if symbol.endswith(".TW") else "")
             st.caption(f"Yahoo 代號：**{symbol}**" + (f"（{mkt}）" if mkt else ""))

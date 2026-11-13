@@ -1,0 +1,13 @@
+# 金鑰與密碼絕不能上傳
+.streamlit/secrets.toml
+*.pfx
+*.p12
+
+# 個人資料
+*逐字稿*
+*談話整理*
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

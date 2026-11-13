@@ -62,13 +62,29 @@ def _is_contract(obj) -> bool:
     try:
         import shioaji as sj
         kinds = tuple(t for t in (getattr(sj, n, None) for n in
-                      ("BaseContract", "Contract", "Stock", "Future", "Option", "Index", "ComboContract"))
+                      ("BaseContract", "Contract", "Stock", "Future", "Option", "Index", "ComboContract",
+                                "StockInfo", "IndexInfo", "FuturesInfo", "OptionInfo", "WarrantInfo"))
                       if isinstance(t, type))
         if kinds and isinstance(obj, kinds):
             return True
     except Exception:  # noqa: BLE001
         pass
     return bool(getattr(obj, "code", None)) and bool(getattr(obj, "security_type", None))
+
+
+def _scan_index(C, exch: str, num: str):
+    """逐一掃描指數合約表，比對 交易所＋代號 或 symbol（如 TSE001）"""
+    try:
+        for grp in C.Indexs:
+            for c in grp:
+                ex = str(getattr(c, "exchange", "")).split(".")[-1].upper()
+                cd = str(getattr(c, "code", ""))
+                sym = str(getattr(c, "symbol", "") or "").upper()
+                if sym == exch + num or (cd == num and exch in ex):
+                    return c
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def resolve_contract(api, code: str):
@@ -79,6 +95,7 @@ def resolve_contract(api, code: str):
     tries = []
     if code[:3] in ("TSE", "OTC") and code[3:].isdigit():
         tries += [lambda: getattr(C.Indexs, code[:3])[code[3:]],
+                  lambda: getattr(getattr(C.Indexs, code[:3]), code),
                   lambda: getattr(C.Indexs, code[:3])[code],
                   lambda: C.Indexs[code[3:]], lambda: C.Indexs[code]]
     tries += [lambda: C.Stocks[code]]                    # 股票、ETF（含 00631L 這類英文字尾）
@@ -91,6 +108,24 @@ def resolve_contract(api, code: str):
             continue
         if _is_contract(c):
             return c
+    if code[:3] in ("TSE", "OTC") and code[3:].isdigit():
+        c = _scan_index(C, code[:3], code[3:])
+        if c is not None:
+            return c
+        try:   # 合約表裡找不到時，直接指定「交易所＋代號」（kbars 接受 BaseContract）
+            import shioaji as sj
+            return sj.BaseContract(security_type="IND", exchange=code[:3], code=code[3:])
+        except Exception:  # noqa: BLE001
+            pass
+    try:   # 股票／ETF：用代號表判斷上市（TSE）或上櫃（OTC）後直接指定
+        import shioaji as sj
+        from tw_symbols import stock_table
+        info = stock_table().get(code)
+        if info:
+            return sj.BaseContract(security_type="STK", exchange="TSE" if info["suffix"] == ".TW" else "OTC",
+                                   code=code)
+    except Exception:  # noqa: BLE001
+        pass
     st = str(getattr(C, "status", "")).split(".")[-1]
     hint = "（合約表尚未下載完成，請稍後再按一次讀取，或登出後重新登入）" if st and st != "Fetched" else ""
     raise ValueError(f"找不到商品代號 {code}{hint}。股票如 2330；指數如 TSE001；期貨如 TXFR1")

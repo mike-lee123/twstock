@@ -178,10 +178,12 @@ with st.sidebar:
     sj_sess = None
     if source == "永豐 Shioaji":
         sj_sess = sinopac_login_panel()
-        sj_opts = tws.options("sj")
+        sj_cat = st.selectbox("代號分類", tws.categories("sj"), key="cat_sj",
+                              help="先選分類縮小清單；「全部」可搜尋所有上市櫃股票")
+        sj_opts = tws.options("sj", sj_cat)
         sym_choice = st.selectbox(
             "商品代號", sj_opts, index=next((i for i, o in enumerate(sj_opts) if o.startswith("2330 ")), 0),
-            key="sym_sj", accept_new_options=True,
+            key=f"sym_sj_{sj_cat}", accept_new_options=True,
             help="可直接打代號或名稱搜尋；清單外的代號也可直接輸入後按 Enter。"
                  "指數 TSE001／OTC101、期貨 TXFR1／MXFR1 在最上面。")
         symbol = tws.code_of(sym_choice)
@@ -194,8 +196,11 @@ with st.sidebar:
         period, upload = f"{sj_start}～{sj_end}", None
         st.caption("永豐 1 分K 可往前抓數年，分K 不受 Yahoo 60 天限制；區間越長下載越久、流量越大。")
     elif source == "Yahoo Finance":
+        yf_cat = st.selectbox("代號分類", tws.categories("yahoo"), key="cat_yahoo",
+                              help="先選分類縮小清單；「全部」可搜尋所有上市櫃股票")
         sym_choice = st.selectbox(
-            "代號", tws.options("yahoo"), index=0, key="sym_yahoo", accept_new_options=True,
+            "代號", tws.options("yahoo", yf_cat), index=0, key=f"sym_yahoo_{yf_cat}",
+            accept_new_options=True,
             help="可直接打代號或名稱搜尋（如 2330、台積電）；自動判斷上市 .TW／上櫃 .TWO。"
                  "清單外的代號也可直接輸入後按 Enter。")
         symbol = resolve_yahoo(sym_choice)
@@ -344,9 +349,8 @@ fibs = fib_retracements(fib_lo, fib_hi)
 def build_chart(view: pd.DataFrame) -> go.Figure:
     x = view.index.strftime("%Y-%m-%d %H:%M" if interval.endswith("m") else "%Y-%m-%d")
     pos = {ts: lbl for ts, lbl in zip(view.index, x)}
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        row_heights=[0.6, 0.2, 0.2],
-                        subplot_titles=("K 線 + 13MA", "KD(9,3,3)", "MACD(12,26,9)"))
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                        row_heights=[0.6, 0.2, 0.2])
     fig.add_trace(go.Candlestick(
         x=x, open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
         increasing=dict(line=dict(color=UP), fillcolor=UP),
@@ -354,10 +358,17 @@ def build_chart(view: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Scatter(x=x, y=view["MA13"], name="13MA",
                              line=dict(color=MA_COLOR, width=2)), 1, 1)
 
+    lo, hi = view["Low"].min(), view["High"].max()
+    y_top, y_bot = hi, lo
     if show_fib:
+        # 只畫落在畫面價格區間附近的關卡，避免遠方的延伸線把 K 線壓扁
+        pad = (hi - lo) * 0.15
         for name, lv in fibs.items():
+            if not (lo - pad <= lv <= hi + pad):
+                continue
+            y_top, y_bot = max(y_top, lv), min(y_bot, lv)
             fig.add_hline(y=lv, line=dict(color="#868e96", dash="dot", width=1),
-                          annotation_text=f"{name} {lv:,.0f}", annotation_position="right",
+                          annotation_text=f"{name.split('（')[0]} {lv:,.0f}", annotation_position="right",
                           annotation_font_size=10, row=1, col=1)
 
     if show_trades and bt.trades:
@@ -384,20 +395,45 @@ def build_chart(view: pd.DataFrame) -> go.Figure:
                 hovertext=[f"出場 {t.exit:,.2f}｜{t.reason}｜損益 {t.pnl:+,.1f}" for t in ex],
                 hoverinfo="text"), 1, 1)
 
-    fig.add_trace(go.Scatter(x=x, y=view["K"], name="K", line=dict(color=K_COLOR)), 2, 1)
-    fig.add_trace(go.Scatter(x=x, y=view["D"], name="D", line=dict(color=D_COLOR)), 2, 1)
+    fig.add_trace(go.Scatter(x=x, y=view["K"], name="K", line=dict(color=K_COLOR),
+                             legend="legend2"), 2, 1)
+    fig.add_trace(go.Scatter(x=x, y=view["D"], name="D", line=dict(color=D_COLOR),
+                             legend="legend2"), 2, 1)
     for y, c in ((50, "#868e96"), (80, UP), (20, DOWN)):
         fig.add_hline(y=y, line=dict(color=c, dash="dot", width=1), row=2, col=1)
 
-    fig.add_trace(go.Bar(x=x, y=view["OSC"], name="MACD 柱",
+    fig.add_trace(go.Bar(x=x, y=view["OSC"], name="MACD 柱", legend="legend3",
                          marker_color=np.where(view["OSC"] >= 0, UP, DOWN)), 3, 1)
-    fig.add_trace(go.Scatter(x=x, y=view["DIF"], name="DIF", line=dict(color=K_COLOR, width=1)), 3, 1)
-    fig.add_trace(go.Scatter(x=x, y=view["MACD"], name="MACD", line=dict(color=MA_COLOR, width=1)), 3, 1)
+    fig.add_trace(go.Scatter(x=x, y=view["DIF"], name="DIF", legend="legend3",
+                             line=dict(color=K_COLOR, width=1)), 3, 1)
+    fig.add_trace(go.Scatter(x=x, y=view["MACD"], name="MACD", legend="legend3",
+                             line=dict(color=MA_COLOR, width=1)), 3, 1)
 
-    fig.update_xaxes(type="category", nticks=12, showgrid=False)
+    # 每個面板各自一組圖例，放在面板左上角內側；面板名稱放在 Y 軸標題，不再跟圖例搶位置
+    def panel_legend(row: int, title: str) -> dict:
+        top = fig.layout[f"yaxis{'' if row == 1 else row}"].domain[1]
+        return dict(title=dict(text=f"<b>{title}</b>　", font=dict(size=12)), orientation="h",
+                    x=0.005, xanchor="left", y=top - 0.005, yanchor="top", font=dict(size=11),
+                    bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(0,0,0,0.08)", borderwidth=1)
+
+    fig.update_xaxes(type="category", nticks=10, showgrid=False)
     fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
-    fig.update_layout(height=820, margin=dict(l=10, r=110, t=40, b=10), hovermode="x unified",
-                      legend=dict(orientation="h", y=1.04, x=0), bargap=0.1)
+    for row, ttl in ((1, "價格"), (2, "KD"), (3, "MACD")):
+        fig.update_yaxes(title_text=ttl, title_font=dict(size=11), automargin=True, row=row, col=1)
+    fig.update_layout(
+        height=820, margin=dict(l=10, r=120, t=20, b=10), hovermode="x unified", bargap=0.1,
+        legend=panel_legend(1, "K 線 + 13MA"),
+        legend2=panel_legend(2, "KD(9,3,3)"),
+        legend3=panel_legend(3, "MACD(12,26,9)"),
+    )
+    fig.update_xaxes(automargin=True)
+    span = y_top - y_bot
+    fig.update_yaxes(range=[y_bot - span * 0.04, y_top + span * 0.14], row=1, col=1)  # 上方留白給圖例
+    fig.update_yaxes(range=[-5, 125], tickvals=[20, 50, 80], row=2, col=1)
+    m_lo = float(np.nanmin(view[["OSC", "DIF", "MACD"]].to_numpy()))
+    m_hi = float(np.nanmax(view[["OSC", "DIF", "MACD"]].to_numpy()))
+    m_span = (m_hi - m_lo) or 1.0
+    fig.update_yaxes(range=[m_lo - m_span * 0.05, m_hi + m_span * 0.35], row=3, col=1)
     return fig
 
 
